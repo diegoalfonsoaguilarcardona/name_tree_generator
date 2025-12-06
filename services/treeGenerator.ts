@@ -23,12 +23,14 @@ function continuousNoise(x: number, y: number, z: number, seed: number, amp: num
 
 /**
  * Helper to apply noise to a geometry's vertices.
+ * Includes a 'safetyZone' to prevent noise from breaking connection points.
  */
 function applyNoiseToGeometry(
     geometry: THREE.BufferGeometry, 
     roughness: number, 
     radius: number, 
-    seedBase: number
+    seedBase: number,
+    safetyYRange?: { min: number, max: number } // Range where noise is dampened
 ) {
     if (roughness <= 0) return;
 
@@ -39,20 +41,35 @@ function applyNoiseToGeometry(
     for (let i = 0; i < posAttribute.count; i++) {
         vertex.fromBufferAttribute(posAttribute, i);
 
-        // Use world-like coordinates (relative to shape center) for noise
-        const nx = continuousNoise(vertex.x, vertex.y, vertex.z, seedBase + 1, noiseAmp);
-        const ny = continuousNoise(vertex.x, vertex.y, vertex.z, seedBase + 2, noiseAmp * 0.2); 
-        const nz = continuousNoise(vertex.x, vertex.y, vertex.z, seedBase + 3, noiseAmp);
+        let ampFactor = 1.0;
+        if (safetyYRange) {
+            // Calculate distance to safety range
+            if (vertex.y >= safetyYRange.min && vertex.y <= safetyYRange.max) {
+                ampFactor = 0.0; // No noise in safety zone
+            } else {
+                // Smooth transition out of safety zone (optional, but keeps mesh clean)
+                const distMin = Math.abs(vertex.y - safetyYRange.min);
+                const distMax = Math.abs(vertex.y - safetyYRange.max);
+                const dist = Math.min(distMin, distMax);
+                // Fade noise in over 0.5 units
+                ampFactor = THREE.MathUtils.smoothstep(dist, 0, 0.5);
+            }
+        }
 
-        vertex.add(new THREE.Vector3(nx, ny, nz));
-        posAttribute.setXYZ(i, vertex.x, vertex.y, vertex.z);
+        if (ampFactor > 0.001) {
+            const nx = continuousNoise(vertex.x, vertex.y, vertex.z, seedBase + 1, noiseAmp);
+            const ny = continuousNoise(vertex.x, vertex.y, vertex.z, seedBase + 2, noiseAmp * 0.2); 
+            const nz = continuousNoise(vertex.x, vertex.y, vertex.z, seedBase + 3, noiseAmp);
+
+            vertex.add(new THREE.Vector3(nx * ampFactor, ny * ampFactor, nz * ampFactor));
+            posAttribute.setXYZ(i, vertex.x, vertex.y, vertex.z);
+        }
     }
     geometry.computeVertexNormals();
 }
 
 /**
- * Caps the open ends of a TubeGeometry (or similar cylinder-like buffer geometry) 
- * to make it a closed, solid volume for clean 3D printing.
+ * Caps the open ends of a TubeGeometry.
  */
 function capTubeGeometry(geo: THREE.BufferGeometry, radialSegments: number, tubularSegments: number) {
     const pos = geo.attributes.position as THREE.BufferAttribute;
@@ -61,26 +78,18 @@ function capTubeGeometry(geo: THREE.BufferGeometry, radialSegments: number, tubu
 
     const stride = radialSegments + 1;
     const numPoints = pos.count;
-
-    // We need to add 2 vertices: start center and end center
     const newNumPoints = numPoints + 2;
-
-    // New faces: 2 caps * radialSegments * 3 indices per face
-    // (This appends to the existing indices)
     const newNumIndices = ind.count + (radialSegments * 2 * 3);
 
-    // Create new bigger buffers
     const newPosArr = new Float32Array(newNumPoints * 3);
     newPosArr.set(pos.array);
 
     const newIndArr = new Uint32Array(newNumIndices);
     newIndArr.set(ind.array);
 
-    // Helper to read vector from buffer
     const getV = (idx: number) => new THREE.Vector3(pos.getX(idx), pos.getY(idx), pos.getZ(idx));
 
     // --- 1. Start Cap (Bottom) ---
-    // Center is average of first ring [0 ... radialSegments]
     const startCenter = new THREE.Vector3();
     for(let i=0; i<radialSegments; i++) {
         startCenter.add(getV(i));
@@ -93,7 +102,6 @@ function capTubeGeometry(geo: THREE.BufferGeometry, radialSegments: number, tubu
     newPosArr[startIdx*3+2] = startCenter.z;
 
     // --- 2. End Cap (Top) ---
-    // Center is average of last ring
     const endCenter = new THREE.Vector3();
     const endOffset = tubularSegments * stride;
     for(let i=0; i<radialSegments; i++) {
@@ -109,45 +117,32 @@ function capTubeGeometry(geo: THREE.BufferGeometry, radialSegments: number, tubu
     // --- 3. Add Indices for Caps ---
     let curInd = ind.count;
 
-    // Start Cap Faces (Indices: StartCenter, NextRingPoint, CurrentRingPoint) => Reverses winding for "Out" normal
     for(let i=0; i<radialSegments; i++) {
         newIndArr[curInd++] = startIdx;
-        newIndArr[curInd++] = i + 1; // Ring wraps naturally because radialSegments index is same pos as 0
+        newIndArr[curInd++] = i + 1;
         newIndArr[curInd++] = i;
     }
 
-    // End Cap Faces (Indices: EndCenter, CurrentRingPoint, NextRingPoint)
     for(let i=0; i<radialSegments; i++) {
         const r0 = endOffset + i;
         const r1 = endOffset + i + 1;
-
         newIndArr[curInd++] = endIdx;
         newIndArr[curInd++] = r0;
         newIndArr[curInd++] = r1;
     }
 
-    // Update Geometry
     geo.setAttribute('position', new THREE.BufferAttribute(newPosArr, 3));
     geo.setIndex(new THREE.BufferAttribute(newIndArr, 1));
 }
 
-/**
- * Helper to prepare geometry for merging:
- * 1. Computes Vertex Normals
- * 2. Converts to Non-Indexed (ensures compatibility between different geometry types)
- * 3. Deletes unused attributes (like color, if any, though usually none)
- */
 function prepareForMerge(geo: THREE.BufferGeometry): THREE.BufferGeometry {
-    geo.computeVertexNormals(); // Ensure smooth shading calculation includes caps if present
+    geo.computeVertexNormals(); 
     if (geo.index) {
         return geo.toNonIndexed();
     }
     return geo;
 }
 
-/**
- * Decomposes a LetterPattern into continuous segments for TubeGeometry.
- */
 function tracePaths(pattern: LetterPattern): string[][] {
     const segments: string[][] = [];
     const processedEdges = new Set<string>();
@@ -204,62 +199,79 @@ export const generateTree = (
   // --- 1. Base Generation ---
   const baseRadius = config.baseRadius ?? (config.trunkRadius * 2.5);
   let baseGeometry: THREE.BufferGeometry;
-  let treeStartY = 0;
+
+  const moundHeight = baseRadius * 0.5;
+  // Calculate the radius of the "flat top"
+  // We want the top flat spot to be just slightly larger than the generic trunk radius
+  // so the trunk sits comfortably on it.
+  const flatTopRadius = config.trunkRadius * 1.1; // 10% larger than trunk
+
+  let treeStartY = moundHeight;
 
   if (config.geometryStyle === 'organic') {
     const points: THREE.Vector2[] = [];
-    const steps = 32; 
-    const moundHeight = baseRadius * 0.5;
+    // 0. Start at Center Bottom (0,0)
+    points.push(new THREE.Vector2(0, 0));
+
+    // 1. Flat Bottom to Rim (baseRadius, 0)
+    points.push(new THREE.Vector2(baseRadius, 0));
+
+    // 2. Curve up to the "Shoulder" (flatTopRadius, moundHeight)
+    const steps = 16; 
     for (let i = 0; i <= steps; i++) {
         const t = i / steps;
-        const angle = (Math.PI / 2) * (1 - t);
-        const x = Math.cos(angle) * baseRadius;
-        const y = Math.sin(angle) * moundHeight;
-        points.push(new THREE.Vector2(x, y));
-    }
-    points.push(new THREE.Vector2(0, 0));
-    // Note: LatheGeometry automatically closes the shape if points create a loop or end at axis
-    baseGeometry = new THREE.LatheGeometry(points, 64);
-    treeStartY = moundHeight;
+        // Quadratic curve from BaseRadius to FlatTopRadius
+        // Using a Cosine ease to make it look mound-like
+        const angle = (Math.PI / 2) * t; // 0 to 90 degrees
 
+        // Interpolate X from BaseRadius down to FlatTopRadius
+        // We use a power function on t to make the base wider at bottom
+        const currentR = baseRadius - (baseRadius - flatTopRadius) * Math.sin(angle);
+        const currentH = moundHeight * (1 - Math.cos(angle));
+
+        points.push(new THREE.Vector2(currentR, currentH));
+    }
+
+    // 3. Flat Top (Center Top)
+    // Closes the loop at the top center height
+    points.push(new THREE.Vector2(0, moundHeight));
+
+    baseGeometry = new THREE.LatheGeometry(points, 32);
+
+    // Apply noise to base, BUT preserve the flat top and flat bottom
     if (config.roughness > 0) {
-        const posAttribute = baseGeometry.attributes.position;
-        const vertex = new THREE.Vector3();
-        const noiseAmp = config.roughness * baseRadius * 0.5;
-        const seedBase = 0;
-
-        for (let i = 0; i < posAttribute.count; i++) {
-            vertex.fromBufferAttribute(posAttribute, i);
-            const heightFactor = THREE.MathUtils.smoothstep(vertex.y, 0, baseRadius * 0.2);
-            if (heightFactor > 0.001) {
-                const nx = continuousNoise(vertex.x, vertex.y, vertex.z, seedBase + 1, noiseAmp) * heightFactor;
-                const ny = continuousNoise(vertex.x, vertex.y, vertex.z, seedBase + 2, noiseAmp * 0.2) * heightFactor;
-                const nz = continuousNoise(vertex.x, vertex.y, vertex.z, seedBase + 3, noiseAmp) * heightFactor;
-                vertex.add(new THREE.Vector3(nx, ny, nz));
-                posAttribute.setXYZ(i, vertex.x, vertex.y, vertex.z);
-            }
-        }
-        baseGeometry.computeVertexNormals();
+        // Safety range: Don't noise the very bottom (bed adhesion) or the very top (trunk connection)
+        const safety = { min: moundHeight * 0.85, max: moundHeight * 2.0 }; 
+        applyNoiseToGeometry(baseGeometry, config.roughness, baseRadius, 0, safety);
     }
+
+    // Flatten the very bottom ring explicitly to y=0 in case noise leaked
+    const pos = baseGeometry.attributes.position;
+    for(let i=0; i<pos.count; i++) {
+        if(pos.getY(i) < 0.1) pos.setY(i, 0);
+    }
+    baseGeometry.computeVertexNormals();
 
   } else {
-    const baseHeight = config.trunkRadius * 1.0;
-    baseGeometry = new THREE.CylinderGeometry(baseRadius * 0.8, baseRadius, baseHeight, 32, 1);
-    treeStartY = baseHeight;
+    // Geometric: A simple cylinder with a flat top
+    baseGeometry = new THREE.CylinderGeometry(flatTopRadius, baseRadius, moundHeight, 32, 1);
+    // CylinderGeometry centers at 0, so we lift it up by half height to sit on 0
+    baseGeometry.translate(0, moundHeight / 2, 0);
+    treeStartY = moundHeight;
   }
 
-  baseGeometry.translate(0, config.geometryStyle === 'organic' ? 0 : config.trunkRadius * 0.5, 0);
   treeGeometries.push(prepareForMerge(baseGeometry));
-
 
   // --- 2. Root Trunk ---
   const rootLength = config.rootLength;
   const rootRadiusTop = config.trunkRadius * config.radiusDecay;
 
-  // FIX: Anchor trunk strictly to bottom (0.0).
-  // This ensures the trunk geometry goes all the way through the base to the build plate,
-  // preventing internal voids and ensuring the main root is solidly attached.
-  const trunkBottomY = 0.0; 
+  // FIX: Explicit Overlap.
+  // Trunk starts slightly BELOW the flat top of the base.
+  // Base Top Y = moundHeight.
+  // Trunk Bottom Y = moundHeight - 0.2.
+  const overlap = 0.2;
+  const trunkBottomY = treeStartY - overlap; 
 
   const trunkTopY = treeStartY + rootLength;
   const trunkHeight = trunkTopY - trunkBottomY;
@@ -267,33 +279,22 @@ export const generateTree = (
   let trunkGeo: THREE.BufferGeometry;
   if (config.geometryStyle === 'organic') {
       trunkGeo = new THREE.CylinderGeometry(rootRadiusTop, config.trunkRadius, trunkHeight, 16, 8, false);
-      applyNoiseToGeometry(trunkGeo, config.roughness, config.trunkRadius, 1);
 
-      // Post-Fix for Organic Noise: Flatten the bottom ring strictly to 0 to avoid floating bits
-      const pos = trunkGeo.attributes.position;
-      const v = new THREE.Vector3();
-      // Original bottom is at -trunkHeight/2. After translation it becomes trunkBottomY.
-      // Here we are centered at 0 before translation.
-      const bottomLimit = -trunkHeight / 2 + 0.1; // Threshold at bottom
-      for (let i = 0; i < pos.count; i++) {
-          v.fromBufferAttribute(pos, i);
-          if (v.y < bottomLimit) {
-             // flatten noise on bottom rim
-             pos.setY(i, -trunkHeight / 2); 
-          }
-      }
-      trunkGeo.computeVertexNormals();
+      // Important: Don't apply roughness to the bottom part of the trunk that mates with the base
+      // This ensures the "peg" stays round and fits into the "hole" (or rather, merges cleanly with the flat top)
+      const safety = { min: -trunkHeight/2 - 0.1, max: -trunkHeight/2 + 1.0 }; // Local coordinates
+      applyNoiseToGeometry(trunkGeo, config.roughness, config.trunkRadius, 1, safety);
 
   } else {
       trunkGeo = new THREE.CylinderGeometry(rootRadiusTop, config.trunkRadius, trunkHeight, 12, 1, false);
   }
 
+  // Align trunk center
   const trunkCenterY = trunkBottomY + (trunkHeight / 2);
   trunkGeo.translate(0, trunkCenterY, 0);
   treeGeometries.push(prepareForMerge(trunkGeo));
 
   const startY = trunkTopY;
-
 
   // --- 3. Leaf Geometry ---
   let leafGeoTemplate: THREE.BufferGeometry | null = null;
@@ -338,7 +339,6 @@ export const generateTree = (
     );
     const levelScale = lengthScale * config.trunkLength * 0.2;
 
-    // Calculate Positions and Constraints
     const nodeWorldPositions = new Map<string, THREE.Vector3>();
     const startPos = new THREE.Vector3(0,0,0).applyMatrix4(parentMatrix);
     nodeWorldPositions.set('node-0', startPos);
@@ -390,7 +390,6 @@ export const generateTree = (
         });
     }
 
-    // Generate Tube Geometry (Branches)
     const paths = tracePaths(pattern);
 
     paths.forEach((pathNodeIds, pathIdx) => {
@@ -411,23 +410,18 @@ export const generateTree = (
         const radialSegments = config.geometryStyle === 'organic' ? 12 : 8;
 
         const tubeGeo = new THREE.TubeGeometry(curve, tubularSegments, radius, radialSegments, false);
-
-        // IMPORTANT: Seal the tube so it is a solid volume (fixes slicing issues)
         capTubeGeometry(tubeGeo, radialSegments, tubularSegments);
 
         const seed = depth * 1000 + pathIdx;
         if (config.geometryStyle === 'organic') {
-            // Note: Noise is applied AFTER capping so the entire organic blob deforms together
             applyNoiseToGeometry(tubeGeo, config.roughness, radius, seed);
         }
 
         treeGeometries.push(prepareForMerge(tubeGeo));
 
-        // Joints - slightly larger radii to ensure overlap with capped tube
         const addJoint = (pos: THREE.Vector3, r: number, s: number) => {
             let jGeo: THREE.BufferGeometry;
-            const jointRadius = r * 1.2; // Slightly larger than before (was 1.1)
-
+            const jointRadius = r * 1.2; 
             if (config.geometryStyle === 'organic') {
                 jGeo = new THREE.IcosahedronGeometry(jointRadius, 1);
                 applyNoiseToGeometry(jGeo, config.roughness, r, s);
@@ -445,7 +439,6 @@ export const generateTree = (
         }
     });
 
-    // --- 5. Leaves & Recursion ---
     const exitNodes = pattern.nodes.filter(n => n.isExit);
 
     exitNodes.forEach((exitNode, exitIndex) => {
@@ -521,7 +514,6 @@ export const generateTree = (
   startMatrix.setPosition(0, startY, 0);
   buildLevel(startMatrix, 0, rootRadiusTop, 1.0);
 
-  // --- 6. Final Merge ---
   let finalWoodGeometry: THREE.BufferGeometry | null = null;
   if (treeGeometries.length > 0) {
       try {
