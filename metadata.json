@@ -1,0 +1,5 @@
+{
+  "name": "Name Tree Generator",
+  "description": "Generate organic 3D fractal trees based on names/words with editable letter patterns.",
+  "requestFramePermissions": []
+}
