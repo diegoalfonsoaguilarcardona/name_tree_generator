@@ -129,10 +129,6 @@ function capTubeGeometry(geo: THREE.BufferGeometry, radialSegments: number, tubu
     // Update Geometry
     geo.setAttribute('position', new THREE.BufferAttribute(newPosArr, 3));
     geo.setIndex(new THREE.BufferAttribute(newIndArr, 1));
-
-    // Note: We don't recompute vertex normals here because we want the cap to be sharp/flat if possible,
-    // or at least handled during the global preparation. 
-    // However, for noise application, we want these new points to be reachable.
 }
 
 /**
@@ -222,6 +218,7 @@ export const generateTree = (
         points.push(new THREE.Vector2(x, y));
     }
     points.push(new THREE.Vector2(0, 0));
+    // Note: LatheGeometry automatically closes the shape if points create a loop or end at axis
     baseGeometry = new THREE.LatheGeometry(points, 64);
     treeStartY = moundHeight;
 
@@ -258,8 +255,12 @@ export const generateTree = (
   // --- 2. Root Trunk ---
   const rootLength = config.rootLength;
   const rootRadiusTop = config.trunkRadius * config.radiusDecay;
-  const safeBottomY = 0.2; 
-  const trunkBottomY = Math.max(safeBottomY, treeStartY - (config.trunkRadius * 0.5));
+
+  // FIX: Anchor trunk strictly to bottom (0.0).
+  // This ensures the trunk geometry goes all the way through the base to the build plate,
+  // preventing internal voids and ensuring the main root is solidly attached.
+  const trunkBottomY = 0.0; 
+
   const trunkTopY = treeStartY + rootLength;
   const trunkHeight = trunkTopY - trunkBottomY;
 
@@ -267,6 +268,22 @@ export const generateTree = (
   if (config.geometryStyle === 'organic') {
       trunkGeo = new THREE.CylinderGeometry(rootRadiusTop, config.trunkRadius, trunkHeight, 16, 8, false);
       applyNoiseToGeometry(trunkGeo, config.roughness, config.trunkRadius, 1);
+
+      // Post-Fix for Organic Noise: Flatten the bottom ring strictly to 0 to avoid floating bits
+      const pos = trunkGeo.attributes.position;
+      const v = new THREE.Vector3();
+      // Original bottom is at -trunkHeight/2. After translation it becomes trunkBottomY.
+      // Here we are centered at 0 before translation.
+      const bottomLimit = -trunkHeight / 2 + 0.1; // Threshold at bottom
+      for (let i = 0; i < pos.count; i++) {
+          v.fromBufferAttribute(pos, i);
+          if (v.y < bottomLimit) {
+             // flatten noise on bottom rim
+             pos.setY(i, -trunkHeight / 2); 
+          }
+      }
+      trunkGeo.computeVertexNormals();
+
   } else {
       trunkGeo = new THREE.CylinderGeometry(rootRadiusTop, config.trunkRadius, trunkHeight, 12, 1, false);
   }
